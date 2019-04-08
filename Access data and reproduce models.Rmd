@@ -346,7 +346,7 @@ predict_probs <- pred_prob(design_list = predict_mort, coef_list = mort_coefs, r
 
 ####Posterior predictions
 This step will take a long time, as it needs to estimate 6000 values from the posterior probability distribution from the model.
-```{r calculate predictions from posterior distribution, , cache=TRUE}
+```{r calculate predictions from posterior distribution}
 mort_prob_pred_draws <- calculate(predict_probs, mort_draws)
 
 mort_prob_pred_mat <- as.matrix(mort_prob_pred_draws)
