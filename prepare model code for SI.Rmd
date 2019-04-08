@@ -1,0 +1,711 @@
+---
+title: Mortality and browse hazard for hand planted buloke seedings at Pine Plains, Wyperfeld National Park (Australia)
+author: "David Duncan, Ami Bennett, Libby Rumpff and Peter Vesk"
+date: "13/03/2019"
+output: bookdown::html_document2
+bibliography: survival.bib
+---
+
+```{r knitr setup, include=FALSE}
+knitr::opts_chunk$set(message=FALSE)
+```
+
+#Summary
+The purpose of this document is to enable peers to reproduce the statistical analysis of mortality and browsing risk to 1275 handplanted buloke (*Allocasuarina luehmannii*) seedlings described in [@bennett_in_prep].
+
+#Acknowledgments
+These models of mortality and browse hazard were implemented in `R` using the package `greta` [@golding2018] with generous support from its author Nick Golding.
+
+#Analysis overview and background
+
+
+#`R` session
+Start by loading the packages that are used within the session. 
+
+If you do not have `greta` installed, please follow the instructions at the project website [here](https://cran.r-project.org/web/packages/greta/vignettes/get_started.html).
+
+```{r load packages and set seed, message=FALSE}
+rm(list=ls())
+
+library(tidyverse) # principally for dplyr and ggplot
+library (greta) # implementation of poisson glmm in bayesian framework
+library(MCMCvis) # visualise MCMC products
+
+set.seed(3010) # postal code of Parkville, Victoria
+```
+We also use the package `coda`, but *don't load it* as it will be in conflict with `greta` for the use of key functions like `mcmc()`.  We'll call it with `coda::`.
+
+On the topic of masking, note that `greta` masks important basic functions from `stats` in base `R` like `binomial` and `poisson` used for invoking families of statistical distributions in models.  To use those functions you will have to specify `stats::binomial`, etc.
+
+**Make some plotting labels and colours**
+
+```{r colours and labels for plotting}
+# plotting colours appropriate for color blind person
+cbbPalette <- c("#D55E00", "#E69F00", "#56B4E9", "#009E73", 
+                "#F0E442", "#0072B2", "#D000000", "#CC79A7")
+
+# prepare some label elements to use with ggplot2
+context_lab <- c(
+  'Buloke woodland' = "Within buloke\nstand",
+  'Open grassland' = "Open\ngrassy",
+  'Mallee' = "Adj. mallee\nwoodland",
+  'Wattle dune' = "Adj. wattle\ndune"
+)
+```
+
+
+##Mortality hazard model
+Start by loading the seedling survival data object.
+```{r load mortality data object}
+mort_data <- readRDS("data/mort_data.Rda")
+
+# Create log days variable for polynomial
+mort_data <- ungroup(mort_data) %>% 
+  mutate(
+         log_days = log(pmax(days, 0.5)) # for polynomial
+         )
+```
+
+The elements of the dataframe are described in the table below.
+
+| Variable |   Form       |   Detail / Comment                   |  
+|:---------|:-------------|--------------------------------------|
+| dead | binary response variable | 0 = alive, 1 = dead  |
+| context  | 4 categories | position of site with respect to landform and vegetation structure  |
+| site     | site identifier | There are 17 sites across the 4 contexts |
+| treatment| 3 categories| Open to any vertebrate herbivores, Partial exclosure, allowing small herbivores access, Total exclusion of vertebrate herbivores |
+| days | integer | Number of days elapsed from the date the seedling was planted to a given census period |
+| lagomorph | numeric                |  Rate of lagomorph pellet accumulation per day per 15.72$^2$ m plot  |
+| kangaroo  | numeric                | Rate of lagomorph pellet accumulation per day per 15.72$^2$ m plot            |
+| sand |  percentage                 | Percentage of soil comprised of sand particles > 20 $\mu m$. Not used in final model    |
+| pc1  |  primary PCA axis           |  For analysis based on vegetation structure and soil properties. Not used in final model.  |
+| pc2  |  secondary PCA axis         |   For analysis based on vegetation structure and soil properties. Not used in final model.  |
+| time | ordinal indicator          | 0 for planting day, final assessments at census 4. Not used in model  |
+| treat_class | binary category | "O" for open to grazing and "G" for guarded, combining total grazing exclusion and partial grazing exclusion. This class was added after seeing the similar response pattern among seedlings in guards of either kind. |
+
+###Inspect the data to your satisfaction
+For convenience, below is the code to produce the summary plot corresponding to the model prediction plots included in the article.  This graph plots results at the level of cohort (proportion surviving) for readability. You'll go back to plot the predictions over these data later on.
+
+```{r, fig.cap="Proportion of hand-planted buloke seedlings alive according to treatment and context"}
+mort_cohort <- mort_data %>% 
+    group_by(site, context, treat_class, treatment, time) %>% 
+    summarise(total = n(),
+              dead = sum(dead),
+              lagomorph = first(lagomorph),
+              kangaroo = first(kangaroo),
+              days = first(days)
+    )
+
+ggplot(mort_cohort, aes(x = days, y = 1 - (dead / total), colour = treatment)) +
+  geom_line(aes(group = interaction(site, treatment)), 
+            size = 1, alpha = 0.5) +
+  geom_point() +
+  labs(x = "Days since planting (Spring '16)", 
+       y = "Proportion of saplings alive") +
+  scale_colour_manual(values=cbbPalette) +
+            scale_fill_manual(values=cbbPalette) +
+  facet_grid(.~context, labeller = as_labeller(context_lab)) + theme_light()
+```
+
+####Model based on individual seedling data, or cohorts?
+Will the error model be a bernoulli based on individual seedling fates, or a binomial based on the site x treatment cohorts?
+
+Here we've modelled on individual seedlings, so each observation is a seedling at a census point.
+
+We center and standardise the numeric variables following @gelman2008, so that their scale is comparable to binary input variables. 
+
+```{r center and standardise the numeric predictors}
+mort_data_cs <- mort_data %>% 
+  mutate_at(vars(lagomorph, kangaroo, log_days),
+            function(x) (x - mean(x, na.rm = TRUE)) / (2 * sd(x, na.rm = TRUE)))
+```
+
+###Prepare greta model
+Unlike other bayesian modelling approaches in `R` like BUGS, JAGS, and Stan, `greta` models are written in `R` language.
+
+That is a great advantage in many ways, perhaps a disadvantage is that the definition can be spread out through code rather than neatly confined. The DAG helps, see below.
+
+####Specify the formula for the linear predictor
+
+```{r formula for the linear predictor}
+mort_lp <- ~ poly(log_days, 2) * treat_class - treat_class + context * treatment + lagomorph + kangaroo  
+```
+
+Here we want to look at the main effect of `treatment`, but for the polynomial, given that the shape of the two guarded classes are so similar, we simplify that interaction to only include a higher level treatment variable (`treat_class`) of open or guarded. We then subtract `treat_class` from the formula so that it has no main effect.
+
+The offset and the site random effect come in the following steps.
+
+####Convenience functions for model alterations
+```{r functions for preparing greta model}
+prep_design <- function(glm_formula, data_obj) {
+  
+  #site id
+  site <- data_obj$site
+  
+  # offset for exposure (n days) defined again to avoid centered and standardized version of log_days
+  log_offset <- log(pmax(data_obj$days, 0.5)) 
+  
+  design_matrix <- model.matrix(glm_formula, data = data_obj)
+  
+  # extract names for later matching
+  coef_names <- colnames(design_matrix)
+  
+  #return design list
+  list(matrix = design_matrix, site = site , log_offset = log_offset, 
+       coef_names = coef_names)
+  
+}
+
+prep_coefs <- function(design_list) {
+  
+  # initiate model coefficients
+  coefs <- normal(0, 10, dim = ncol(design_list$matrix))
+
+  # extract names for later matching with env covariates
+  coef_names <- colnames(design_list$matrix)
+  
+  # site random effect
+  n_site <- length(unique(design_list$site))
+  site_sd <- normal(0, 3, truncation = c(0, Inf))
+  site_coef <- normal(0, 1, dim = n_site) * site_sd
+  
+  list(coefs = coefs, coef_names = coef_names,
+       site_sd = site_sd, site_coef = site_coef 
+       )
+}  
+
+
+pred_prob <- function(design_list, coef_list, 
+                      random_effect = TRUE, # can run without
+                      type = c('link', 'response')) {
+  
+  type = match.arg(type)
+  
+  if (sum(design_list$coef_names != coef_list$coef_names) >0) stop("the coeficient list from design and coeficient lists do not match")
+  
+  # linear prediction matrix
+
+  eta <- design_list$matrix %*% coef_list$coefs + design_list$log_offset
+    
+  if (random_effect) {  
+    
+    site_effect <- coef_list$site_coef[design_list$site]
+    
+    # linear prediction matrix with site random effect
+    eta <- eta + site_effect
+    
+  }
+  
+  switch(type, 
+         link = eta, 
+         response = icloglog(eta))
+}
+  
+```
+
+#####Design model matrix
+```{r}
+mort_design <- prep_design(glm_formula = mort_lp, data_obj = mort_data_cs)
+```
+
+#####Define the variables and coefficients to be estimated
+Here we prepare the greta variable arrays that are required to be estimated with the model. Priors are specified here.
+
+```{r}
+mort_coefs <- prep_coefs(design_list = mort_design)
+```
+
+#####Combine model elements
+This function combines the linear predictor, coefficients, and random effects to form the full deterministic component. The `type` argument specifies whether to return on the link (cloglog) or response (probability) scale.
+```{r}
+mort_probs <- pred_prob(design_list = mort_design, 
+                        coef_list = mort_coefs,
+                        type = 'response')
+```
+
+####Specify observation error model
+
+```{r}
+distribution(mort_data$dead) <- bernoulli(mort_probs)
+```
+
+####Define elements to monitor
+We can choose to monitor whichever coefficients we want, or indeed obtain the fitted value for the probability of mortality at each observation (but there are more than 6000 of them).
+```{r}
+coefs <-  mort_coefs$coefs
+site_sd <-  mort_coefs$site_sd
+
+mort_mod <- model(coefs, site_sd, precision = "double") # can monitor whatever in here, e.g.,  site_sd 
+```
+
+####DAG
+One of the charms of `greta` is that you can view a directed acyclic graph representation of the model you have specified. This is how the mortality model looks:
+```{r}
+plot(mort_mod)
+```
+
+####Prepare initial values
+The model wouldn't initialise with its default initials. We found that we had to provide an initial value for the intercept in the region in which it was estimated by the earlier models we tried in `glmer` and `gam` (see [Model development endnotes](#Model development endnotes)).
+```{r prepare initial values}
+init_means <- c(-5, rep(0, length(mort_coefs$coefs)-1))
+
+mort_inits <- replicate(4, initials(coefs = rnorm(length(init_means),init_means, 0.4),
+                                    site_sd = abs(rnorm(1, 0, 1))),
+                        simplify = FALSE)
+```
+
+###Run MCMC sampler 
+Assuming you have a multiple core machine, this code will run one chain per core in parallel.
+```{r run Hamiltonian sampler, message=FALSE}
+mort_draws <- greta::mcmc(mort_mod,
+                    warmup = 2000,
+                    n_samples = 10000, 
+                    initial_values = mort_inits)
+```
+
+###Model evaluation
+Before inspecting elements of the model, we reattach the coefficient names so that we can see which coefficients are behaving well or badly.
+
+Because we added the standard deviation on the site random effect as a coefficient, we exclude it by name because it will have been moved to first position in the reported values (even if it is listed last in the list of variable to monitor).
+```{r reattach coefficient names}
+coda::varnames(mort_draws)[-grep("^site_sd$", coda::varnames(mort_draws))] <- mort_design$coef_names[]
+
+# Then make a convenience object for later on
+mcmc_names <- mort_design$coef_names[]
+```
+
+####Inspect posterior samples from mort model
+Gelman Rubin statistic
+```{r gelman rubin statistic}
+coda::gelman.diag(mort_draws)
+```
+
+To view the MCMC trace diagram or caterpillar plot, execute the following code.  
+```{r, fig.height=10, fig.cap="MCMC samples for monitored coefficients in mortality hazard model"}
+plot(mort_draws)
+```
+
+#### Access parameter estimates
+The parameter esimates from the model can be accessed with the following code:
+```{r view param estimates, eval=FALSE}
+head(summary(mort_draws)[1])
+```
+
+###Reproduce coefficient plot
+```{r, fig.cap="Standardised model coefficient estimates (median ± 50% and 95% posterior intervals) for the instantaneous mortality hazard of hand-planted buloke (Allocasuarina luehmannii) saplings. Values are expressed on the complementary log-log scale. Positive values imply greater hazard and thus lower survivorship. The model intercept referred to an unguarded sapling planted into the buloke woodland context with average levels of kangaroo and lagomorph pellets. Grey line and fill indicate where 0 is included within the 95% credible interval, and grey open symbol indicates where 0 is included within the 50% credible interval. "}
+# make an object to catch the polynomial terms
+poly_coefs <- grep("poly", mcmc_names) 
+
+# plot the coefficients
+MCMCplot(mort_draws,
+         mcmc_names[-poly_coefs], # remove the polynomial terms, they are on a very different scale
+         excl = "(Intercept)", # remove the intercept too
+         rank = TRUE,  # ascending order by median
+         xlab = "Parameter estimates",  
+         ref_ovl = TRUE, sz_ax = 1)  
+```
+
+### Mortality prediction data set
+This function creates a prediction data set that includes permutations of high to low browser activity over a 365 day period.
+```{r create a prediction dataset}
+mort_pred_df <- function(df) {
+  
+  treatment  <-  c("Open", "Partial", "Total")
+  kangaroo <- quantile(df$kangaroo, probs = c(.1,.5,.9))
+  lagomorph <- quantile(df$lagomorph, probs = c(.1,.25,.5,.75,.9))
+  context <- c('Buloke woodland', 'Mallee', 'Open grassland', 
+               'Wattle dune')
+  days <- seq(1, 365, length.out = 30)
+  
+  
+  tmp <- data.frame(
+    expand.grid('treatment' = treatment, 
+                'kangaroo' = kangaroo, 
+                'lagomorph' = lagomorph, 'context' = context, 'days' = days)
+    )
+  
+  tmp <- tmp %>% mutate(
+    treat_class = if_else(treatment == "Open", "O", "G"),
+    log_days = log(pmax(days, 0.5))
+  )
+  
+  return(tmp)
+}
+```
+
+
+
+```{r define prediction set and prepare for greta}
+mort_pred_set <- mort_pred_df(df = mort_data)
+
+predict_mort <- prep_design(glm_formula = mort_lp, 
+                            data_obj = mort_pred_set)
+
+predict_probs <- pred_prob(design_list = predict_mort, coef_list = mort_coefs, random_effect = FALSE, type = 're')
+```
+
+####Posterior predictions
+This step will take a long time, as it needs to estimate 6000 values from the posterior probability distribution from the model.
+```{r calculate predictions from posterior distribution, , cache=TRUE}
+mort_prob_pred_draws <- calculate(predict_probs, mort_draws)
+
+mort_prob_pred_mat <- as.matrix(mort_prob_pred_draws)
+mort_prob_pred_mean <- colMeans(mort_prob_pred_mat)
+mort_prob_pred_CI <- t(apply(mort_prob_pred_mat, 2, quantile, c(0.025, 0.975)))
+
+mort_pred_plot_df <- data.frame(mort_pred_set, mort_prob_pred_mean, mort_prob_pred_CI)
+
+mort_pred_plot_df$context <- factor(mort_pred_plot_df$context,
+          levels = c("Buloke woodland", 
+                     "Open grassland", 
+                     "Wattle dune", "Mallee"))
+```
+
+### Reproduce mortality effect plot figure
+The probability of mortality is subtracted from 1 in these graphs to emphasise survival.  
+
+The main difference from the figure we included in the article is that after setting up the basic frame, but then plot the raw data before overlaying the prediction
+```{r, fig.cap="Predicted survival of hand-planted buloke (Allocasuarina luehmannii) saplings (mean ± 95% credible interval) over 365 days for combinations of planting context and browser exclusion treatment with median levels of kangaroo and lagomorph activity. Random site variation was excluded from the prediction."}
+mort_rab_med <- mort_pred_plot_df %>% 
+  filter(lagomorph == median(lagomorph), # can change to max, min, etc
+         kangaroo == median(kangaroo)) %>% # as above
+  group_by(treatment, context, days) %>% 
+  summarise(mort_prob_pred_mean = mean(mort_prob_pred_mean),
+            mort_prob_upper = mean(X97.5.),
+            mort_prob_lower = mean(X2.5.)) 
+
+# Set up the basic frame
+ggplot(mort_rab_med, 
+       aes(x = days, y = 1 - mort_prob_pred_mean,
+           colour=treatment)) + # add raw data summary from earlier
+  geom_point(aes(x = days, y = 1 - (dead / total), colour = treatment), data = mort_cohort, alpha=0.2, size = 0.5) +
+  geom_line(aes(x = days, y = 1 - (dead / total), 
+                group = interaction(site, treatment)), 
+            size = .3, alpha = 0.3, data = mort_cohort) +
+  geom_line(aes(group = treatment), size=1) +  # then
+  geom_ribbon(aes(ymin = 1-mort_prob_lower, ymax = 1-mort_prob_upper, 
+                  fill=treatment, group = treatment), 
+              alpha=0.3, linetype = 0,
+              show.legend = FALSE) + 
+  facet_grid(.~context) +
+  theme_minimal() + 
+  labs(x = "Days elapsed", y = "Prob. of survival", colour = "Treatment") + 
+  scale_fill_manual(values = cbbPalette) +
+  scale_color_manual(values = cbbPalette) 
+```
+
+## Browse hazard model 
+The model of browse hazard is very similar to the mortality hazard model and for that reason the process is not broken into as many steps and commented as intensely as the above. I'll underline the ways that they differ here.  
+ 
+###No polynomial term included
+whereas the mortality model included a quadratic polynomial term to better represent the curvature of the response through time, it was not required for the browse model
+###Interactions of treatment type and browser activity
+Because far more seedlings were browsed than died, there was greater balance between 0s (unbrowsed) and 1s (browsed). This allowed us to estimate more parameters. We included an interaction between the treatment type and the browser activity.  For example, increasing browser activity should not affect seedlings in the total exclosure, or conversely if there was very low activity then the effect of treatments would be reduced or negligible.
+
+```{r hide away some of data prep, echo=FALSE, eval=FALSE}
+browse_CnS <- ungroup(browse_alt) %>%
+  mutate_at(vars(HtCM, StDMM, sand:start_dm), 
+            function(x) (x - mean(x, na.rm = TRUE)) / (2 * sd(x, na.rm = TRUE)))
+
+real_data <- browse_CnS %>% 
+  mutate_if(is.character, factor) %>% 
+  mutate_at(vars(site, Time, Dead), funs(factor)) %>% 
+  filter(Treat != 'Total') %>% 
+  transmute(context, site, time = Time, treatment = droplevels(Treat), 
+            days = elapsedDays, browsed = browsed, 
+            lagomorph = Lagomrph_site_mean, kangaroo = Roo_site_mean, 
+            sand)
+
+real_data <- real_data %>% 
+  mutate(treat_class = if_else(treatment == "Open", "O", "G"))
+
+saveRDS(real_data, file = "data/browse_data.Rda")
+```
+
+Load browse hazard data
+```{r load clean and simplified browse data}
+browse_data <- readRDS("data/browse_data.Rda")
+```
+
+###Inspect the raw data
+Recall that
+```{r}
+browse_cohort <- browse_data %>% 
+  group_by(site, context, treat_class, treatment, time) %>% 
+  summarise(total = n(),
+            browsed = sum(browsed),
+            lagomorph = first(lagomorph),
+            kangaroo = first(kangaroo),
+            days = first(days))
+
+ggplot(browse_cohort, aes(x = days, y = browsed / total, colour = treatment)) +
+  geom_line(aes(group = interaction(site, treatment)), 
+            size = 0.8, alpha = 0.5) +
+  geom_point() +
+  labs(x = "Days since planting (Spring '16)", 
+       y = "Proportion of saplings alive") +
+  scale_colour_manual(values=cbbPalette) +
+  scale_fill_manual(values=cbbPalette) +
+  facet_grid(.~context, labeller = as_labeller(context_lab)) + theme_light()
+```
+
+###Prepare greta model
+
+####Specify the formula for the linear model
+```{r linear predictor for browse hazard}
+browse_lp <- ~ context * treatment + lagomorph * treatment + kangaroo * treatment
+```
+
+####Prepare the model matrix, variables and combine
+```{r}
+browse_design <- prep_design(glm_formula = browse_lp,
+                             data_obj = browse_data)
+
+browse_coefs <- prep_coefs(design_list = browse_design)
+
+browse_probs <- pred_prob(design_list = browse_design, coef_list = browse_coefs, random_effect = TRUE, type = 're')
+```
+
+####Specify observation error model
+```{r select appropriate error model for observations}
+distribution(browse_data$browsed) <- bernoulli(browse_probs)
+```
+
+####Prepare initial values
+hack the initial values so that the intercept is small
+```{r}
+b_coefs <- browse_coefs$coefs
+b_sd <- browse_coefs$site_sd
+  
+browse_mod <- model(b_coefs, b_sd, 
+                    precision = "double") 
+  
+b_init_means <- c(-5, rep(0, length(b_coefs)-1))
+
+browse_inits <- replicate(4, initials(
+  b_coefs = rnorm(length(b_coefs), b_init_means, 0.4), 
+  b_sd = abs(rnorm(1, 0, 1))),
+  simplify = FALSE)
+```
+
+###Run MCMC sampler for browse hazard model
+
+```{r run Hamiltonian MCMC sampler on browse model, message=FALSE}
+browse_draws <- mcmc(browse_mod, 
+                     warmup = 2000,
+                     n_samples = 10000, 
+                     initial_values = browse_inits)
+```
+
+Reattach the sensible names again, as we did for the mortality hazard model.
+
+```{r }
+coda::varnames(browse_draws)[-grep("_sd$", coda::varnames(browse_draws))] <- browse_design$coef_names[]
+
+mcmc_names <- browse_design$coef_names[]
+```
+
+View Gelman Rubin statistic for the parameters
+```{r Gelman-Rubin statistics on browse model}
+coda::gelman.diag(browse_draws)
+```
+
+View the MCMC trace and density plots per parameter
+```{r, fig.height=10, fig.cap="Caterpillar plots for browse hazard model"}
+plot(browse_draws)
+```
+
+
+###Reproduce effect plot for browse hazard
+
+```{r, fig.cap = "Standardised model coefficients (median ± 50% and 95% posterior intervals) for the instantaneous hazard of significant browsing for hand-planted buloke (Allocasuarina luehmannii) saplings. Values are expressed on the complementary log-log scale. Positive values imply greater browse hazard. The model intercept refers to an unguarded sapling planted into the buloke woodland context and subject to average herbivore activity levels. Grey lines and fill indicate where a 95% credible interval includes 0, and grey open symbol where 0 is included within the 50% credible interval."}
+MCMCplot(browse_draws,
+         excl = c("b_sd", "(Intercept)"), 
+         rank = TRUE,  # ascending order by median
+         xlab = "Parameter estimates\n(cloglog scale)",  
+         ref_ovl = TRUE, sz_ax = 1)
+```
+
+```{r function to make browse prediction df}
+browse_pred_df <- function(df) {
+  
+  treatment  <-  c("Open", "Partial") # exclude Total treatment
+  kangaroo <- quantile(df$kangaroo, probs = c(.1, .5, .9))
+  lagomorph <- quantile(df$lagomorph, probs = c(.1,.25,.5,.75,.9))
+  context <- c('Buloke woodland', 'Mallee', 'Open grassland', 
+    'Wattle dune')
+  days <- seq(1, 365, length.out = 30)
+  
+  tmp <- data.frame(
+    expand.grid('treatment' = treatment, 'kangaroo' = kangaroo, 
+                'lagomorph' = lagomorph, 'context' = context, 'days' = days)
+  )
+  
+  tmp <- tmp %>% mutate(
+    treat_class = if_else(treatment == "Open", "O", "G")
+  )
+  
+  return(tmp)
+  
+}
+```
+
+###Make prediction dataset for browse hazard
+
+```{r}
+# make prediction df
+df_browse_pred <- browse_pred_df(df = browse_data)
+
+# make model design matrix
+predict_browse <- prep_design(glm_formula = browse_lp, 
+                              data_obj = df_browse_pred)
+
+# organise full predicition matrix, recycling coef list from earlier
+predict_probs <- pred_prob(design_list = predict_browse, 
+                           coef_list = browse_coefs, 
+                           random_effect = FALSE, type = 're')
+
+# calculate predictions from posterior distribution
+b_test <- calculate(predict_probs, browse_draws)
+
+# extract and summarise
+browse_prob_pred_summary <- summary(b_test)
+browse_prob_pred_mean <- browse_prob_pred_summary$statistics[, "Mean"]
+browse_prob_pred_CI <- browse_prob_pred_summary$quantiles[, c(1, 5)]
+
+browse_output_df <- data.frame(df_browse_pred, browse_prob_pred_mean, browse_prob_pred_CI)
+
+# set plotting order of site contexts
+browse_output_df <- browse_output_df %>% 
+  mutate(context = factor(context, 
+                          levels = c("Buloke woodland", 
+                                     "Open grassland",
+                                     "Wattle dune" , "Mallee")
+  )
+  )
+```
+
+
+```{r, fig.cap="Adjusted accumulated risk of significant browse damage (mean ± 95% credible interval) for hand-planted buloke (*Allocasuarina luehmannii*) saplings over 365 days as a function of planting context and browser exclusion treatment. The prediction does not include random site variation.", fig.height=6}
+lago_med <- browse_output_df %>% 
+  filter(lagomorph == median(lagomorph)) %>% 
+  group_by(treatment, context, days) %>% 
+  summarise(browse_prob_pred_mean = mean(browse_prob_pred_mean),
+            browse_prob_upper = mean(X97.5.),
+            browse_prob_lower = mean(X2.5.))
+
+ggplot(data = lago_med, aes(x = days, 
+                            y = browse_prob_pred_mean, 
+                            colour=treatment, 
+                            group =treatment)) +
+  geom_point(data = browse_cohort, aes(x = days, y = browsed / total, 
+                                      colour = treatment), 
+             size = 0.5, alpha = 0.5) +
+  geom_line(data = browse_cohort, aes(x = days, y = browsed / total,
+                                      group = interaction(site, treatment)),
+            size = 0.3, alpha = 0.3) +
+  geom_ribbon(aes(ymin = browse_prob_lower, 
+                  ymax = browse_prob_upper, 
+                  group = treatment, 
+                  fill=factor(treatment)), alpha=0.3, 
+              show.legend = FALSE, linetype = 0) + 
+  geom_line(size=1) + 
+  facet_grid(.~context, 
+             labeller = labeller(context = as_labeller(context_lab))) + 
+  theme_minimal() +
+  labs(x = "Days elapsed after planting", y = "Prob. browse damage to main stem", colour = "Treatment") +
+  scale_fill_manual(values = cbbPalette) +
+  scale_color_manual(values = cbbPalette) 
+```
+
+###Reproduce effect of lagomorph activity given context and treatment
+
+suppressing open grass where lagomorph activity was near zero according to the pellet activity data
+```{r, fig.cap="Predicted cumulative effect at 365 days of lagomorph activity (± 95% CI) on the browse hazard for hand-planted buloke (Allocasuarina luehmannii) saplings at each of the three landscape contexts where lagomorph activity was recorded.", fig.height=6}
+browse_output_df %>% 
+  filter(days==365, context != "Open grassland") %>% 
+  group_by(treatment, context, lagomorph) %>% 
+  summarise(mean = mean(browse_prob_pred_mean),
+            lower = mean(X2.5.),
+            upper = mean(X97.5.)) %>% 
+  ggplot(mapping = aes(x = lagomorph, y = mean, 
+                       colour=treatment, group =treatment)) + 
+  geom_line(size=1) + theme_minimal() + 
+  geom_ribbon(aes(ymin=lower, ymax=upper, fill = treatment), 
+              alpha = 0.2, linetype = 0,
+              show.legend = FALSE) + 
+  labs(x = "Lagomorph pellets (standardised)",
+       y = "Prob. of main stem browse damage") +
+  facet_grid(.~context, 
+             labeller = labeller(context = as_labeller(context_lab))) + 
+  scale_x_continuous(breaks=c(-0.25, 0, 0.25, 0.5), labels = c(-0.25, 0, "", 0.5))+
+  scale_fill_manual(values = cbbPalette) +
+  scale_color_manual(values = cbbPalette)
+```
+
+#Model development endnotes
+This section aims to explain some of the choices we experimented with in this modelling process, and also to facilitate comparison of our results with other commonly used modelling frameworks and packages. 
+
+####Classic Cox survival model via `survival` package
+Because this was my first experience with these data I started with implementation of simple proportional hazards model using the `survival` package [@survival2015] and ignoring important nested elements of the sampling design.   A chart of survival by treatment highlights the main result elaborated in the analysis above.
+
+
+####Representing variable hazard rate
+The hazard rate appeared to vary through the course of the experiment with steep early mortality slowing down as the days progressed.  
+
+However, there was a clear sense of curvature that depended on treatment group; while the early sharp decline was more or less shared, after the first several months the accumulation of dead seedlings was far slower in protected treatments, approaching flat in some cases.  That called for an interaction between whatever non-linear element we implemented and treatment class, implying a jump in model complexity.
+
+We considered several different modes of implementation of non-linearity in the hazard rate.
+
+**Monotonic spline**
+At first we tried to remain agnostic about the shape of the curve function describing change in the hazard rate, and for that reason smooth spline functions appealed.
+
+An implementation of smooth terms in greta via the `iSpline` function [@Wang2018] implied a negative hazard rate towards the end of year dataset - effectively dead seedlings coming back to life.  The same result occured with splines implemented within the `gam()` framework.
+
+**Exponential decay**
+We have not implemented this model.
+
+####Linear mixed effect model fitted with `glmer`
+Generalized linear mixed models implemented with `glmer` in the `lme4` package [@Bates2015]. We moved away from this format but in the end could probably have come back to it given that we ended up implementing the time varying hazard with a quadratic polynomial.
+```{r, eval=FALSE}
+library(lme4)
+
+summary(glmer(
+  dead ~ treatment * context + lagomorph + kangaroo + offset(log(pmax(days,0.5))) + 
+    (1 | site),
+  etastart = rep(0,6375),
+  data = mort_data, 
+  family = stats::binomial('cloglog') 
+)
+)
+```
+
+####Generalised additive mixed effects model fitted with `gam`
+Model experimentation with the GAM framework was implemented with the `mgcv` package [@Wood2017]. The experiments ended up with examples like the below, which is very close to the implementation in `greta`.  Whilst these models got very close to what we anticipated would be the final models, the predictions resulted in a negative hazard, implying that seedlings returned to life. Therefore, we had to keep looking.  
+```{r, eval=FALSE}
+library(mgcv)
+summary(gam(dead ~ treatment * context + lagomorph + kangaroo +
+    s(days, by = factor(treat_class), k=3) +
+    s(site, bs = 're') + # random effect for site 
+  #  s(uniqID, bs = 're') + # individual random effect
+    offset(log(pmax(days,0.5))),
+    data = mort_data_cs,
+    method = 'REML',
+    family = stats::binomial('cloglog'),
+    control = list(scale.est = 'deviance')
+  )
+)
+```
+
+
+
+####Choice of observation error model: Binomial or Bernoulli?
+
+By invoking the Bernoulli distribution, as we move from one census to the next we implicitly treat the seedlings as a new set of independent observations, rather than the same seedlings' identity being tracked through time.
+
+One alternative is to model the proportion dead of each treatment x site cohort at each census, in that way registering the relationship of the cohort from one census to the next via the grouping variable site. 
+
+The results and parameter estimates were very similar between these two approaches. We have reported using the former (Bernoulli error distribution for the status of each seedling at each census) as it appears to assist in defining the polynomial terms, thereby producing a model that better fit the data.
+
+
+#References
